@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -222,16 +223,17 @@ class UpgradeSupervisor:
     def _verify(self, cwd: Path) -> tuple[bool, list[str]]:
         notes: list[str] = []
 
-        checks: list[tuple[str, list[str]]] = [
-            ("compile", ["python3", "-m", "compileall", "nanobot"]),
-            ("ruff", ["ruff", "check", "."]),
-            ("pytest", ["pytest", "-q"]),
+        py = sys.executable
+        checks: list[tuple[str, list[str] | None]] = [
+            ("compile", [py, "-m", "compileall", "nanobot"]),
+            ("ruff", [str(cwd / ".venv" / "bin" / "ruff"), "check", "."] if (cwd / ".venv" / "bin" / "ruff").exists() else (["ruff", "check", "."] if shutil.which("ruff") else None)),
+            ("pytest", [str(cwd / ".venv" / "bin" / "pytest"), "-q"] if (cwd / ".venv" / "bin" / "pytest").exists() else (["pytest", "-q"] if shutil.which("pytest") else None)),
         ]
 
         executed = 0
         for name, cmd in checks:
-            if shutil.which(cmd[0]) is None:
-                notes.append(f"Skipped {name}: '{cmd[0]}' not found.")
+            if cmd is None:
+                notes.append(f"Skipped {name}: tool not found.")
                 continue
             executed += 1
             ok, out = self._run_cmd(cmd, cwd=cwd, timeout=600, check=False)
@@ -304,8 +306,6 @@ class UpgradeSupervisor:
             "exec",
             "--sandbox",
             "workspace-write",
-            "--ask-for-approval",
-            "never",
             prompt,
         ]
         return self._run_cmd(cmd, cwd=cwd, timeout=timeout, check=False)
