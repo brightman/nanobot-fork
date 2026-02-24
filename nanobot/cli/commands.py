@@ -1041,6 +1041,9 @@ def status():
 provider_app = typer.Typer(help="Manage providers")
 app.add_typer(provider_app, name="provider")
 
+upgrade_app = typer.Typer(help="Managed self-upgrade workflow")
+app.add_typer(upgrade_app, name="upgrade")
+
 
 _LOGIN_HANDLERS: dict[str, callable] = {}
 
@@ -1115,6 +1118,118 @@ def _login_github_copilot() -> None:
     except Exception as e:
         console.print(f"[red]Authentication error: {e}[/red]")
         raise typer.Exit(1)
+
+
+# ============================================================================
+# Upgrade Supervisor Commands
+# ============================================================================
+
+
+@upgrade_app.command("request")
+def upgrade_request(
+    title: str = typer.Option(..., "--title", help="Short title for the upgrade task"),
+    prompt: str = typer.Option(..., "--prompt", help="Detailed upgrade requirement"),
+    scope: str = typer.Option("core", "--scope", help="Upgrade scope: skill or core"),
+    requested_by: str = typer.Option("user", "--by", help="Requester identity"),
+):
+    """Queue an upgrade request for the external supervisor."""
+    from nanobot.config.loader import load_config
+    from nanobot.supervisor import UpgradeRequest, UpgradeTaskStore
+
+    scope = scope.strip().lower()
+    if scope not in {"skill", "core"}:
+        console.print("[red]Error:[/red] --scope must be 'skill' or 'core'")
+        raise typer.Exit(1)
+
+    config = load_config()
+    workspace = config.workspace_path
+    store = UpgradeTaskStore(workspace)
+    req = UpgradeRequest.create(title=title, prompt=prompt, scope=scope, requested_by=requested_by)
+    path = store.enqueue(req)
+
+    console.print(f"[green]✓[/green] Upgrade task queued: [cyan]{req.id}[/cyan]")
+    console.print(f"Queue file: {path}")
+    console.print(f"Task log: {store.tasks / f'{req.id}.md'}")
+
+
+@upgrade_app.command("status")
+def upgrade_status():
+    """Show supervisor queue/status summary."""
+    from nanobot.config.loader import load_config
+    from nanobot.supervisor import UpgradeTaskStore
+
+    config = load_config()
+    store = UpgradeTaskStore(config.workspace_path)
+
+    pending = store.list_pending()
+    console.print("[bold]Upgrade Queue[/bold]")
+    console.print(f"Pending: {len(pending)}")
+    if pending:
+        console.print("Oldest pending:")
+        for p in pending[:5]:
+            console.print(f"  - {p.name}")
+    console.print(f"Tasks: {store.tasks}")
+    console.print(f"Logs: {store.logs}")
+
+
+@upgrade_app.command("supervisor")
+def upgrade_supervisor(
+    service_cmd: str = typer.Option(
+        "python3 -m nanobot gateway",
+        "--service-cmd",
+        help="Service command managed by supervisor",
+    ),
+    repo: str = typer.Option(".", "--repo", help="Repository root to upgrade/deploy"),
+    timeout_minutes: int = typer.Option(30, "--timeout-minutes", help="Max build/test time per task"),
+    health_grace_seconds: int = typer.Option(20, "--health-grace-seconds", help="Service startup health grace"),
+):
+    """Run the external upgrade supervisor loop."""
+    from nanobot.config.loader import load_config
+    from nanobot.supervisor import UpgradeSupervisor
+
+    config = load_config()
+    supervisor = UpgradeSupervisor(
+        workspace=config.workspace_path,
+        repo_root=Path(repo).expanduser().resolve(),
+        service_cmd=service_cmd,
+        build_timeout_s=max(1, timeout_minutes) * 60,
+        health_grace_s=max(1, health_grace_seconds),
+    )
+
+    console.print("[green]✓[/green] Starting upgrade supervisor")
+    console.print(f"Workspace: {config.workspace_path}")
+    console.print(f"Repo: {supervisor.repo_root}")
+    console.print(f"Service cmd: {service_cmd}")
+    console.print(f"Task timeout: {timeout_minutes} min")
+    supervisor.run_forever()
+
+
+@upgrade_app.command("run-once")
+def upgrade_run_once(
+    service_cmd: str = typer.Option(
+        "python3 -m nanobot gateway",
+        "--service-cmd",
+        help="Service command managed by supervisor",
+    ),
+    repo: str = typer.Option(".", "--repo", help="Repository root to upgrade/deploy"),
+):
+    """Start supervisor, print status, and process queue in the current process."""
+    from nanobot.config.loader import load_config
+    from nanobot.supervisor import UpgradeSupervisor
+
+    config = load_config()
+    supervisor = UpgradeSupervisor(
+        workspace=config.workspace_path,
+        repo_root=Path(repo).expanduser().resolve(),
+        service_cmd=service_cmd,
+    )
+
+    status = supervisor.status()
+    console.print("Initial status:")
+    for k, v in status.items():
+        console.print(f"  {k}: {v}")
+    console.print("Starting loop (Ctrl+C to stop)...")
+    supervisor.run_forever()
 
 
 if __name__ == "__main__":
