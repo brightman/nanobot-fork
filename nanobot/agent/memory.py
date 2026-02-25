@@ -45,8 +45,12 @@ _SAVE_MEMORY_TOOL = [
 class MemoryStore:
     """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
 
-    def __init__(self, workspace: Path):
-        self.memory_dir = ensure_dir(workspace / "memory")
+    def __init__(self, workspace: Path, user_key: str | None = None):
+        self.user_key = sanitize_user_key(user_key) if user_key else None
+        if self.user_key:
+            self.memory_dir = ensure_dir(workspace / "memory" / "users" / self.user_key)
+        else:
+            self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
 
@@ -148,3 +152,34 @@ class MemoryStore:
         except Exception:
             logger.exception("Memory consolidation failed")
             return False
+
+
+def resolve_user_key(channel: str, sender_id: str | None) -> str:
+    """Resolve canonical user key used by per-user memory directories."""
+    channel_norm = (channel or "").strip().lower()
+    if channel_norm == "cli":
+        return "cli"
+    if channel_norm == "system":
+        return "system"
+
+    sid = (sender_id or "").strip()
+    if not sid or sid.lower() in {"unknown", "user"}:
+        return "unknown"
+
+    # Telegram sender_id is often "<id>|<username>"; use the stable numeric id.
+    if channel_norm == "telegram" and "|" in sid:
+        sid = sid.split("|", 1)[0].strip() or sid
+
+    return sanitize_user_key(f"{channel_norm}__{sid}")
+
+
+def sanitize_user_key(key: str | None) -> str:
+    """Sanitize user key to keep it filesystem-safe."""
+    raw = (key or "").strip()
+    if not raw:
+        return "unknown"
+    unsafe = '<>:"/\\|?*'
+    for ch in unsafe:
+        raw = raw.replace(ch, "_")
+    raw = raw.replace("\n", "_").replace("\r", "_")
+    return raw or "unknown"

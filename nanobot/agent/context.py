@@ -71,6 +71,13 @@ Skills with available="false" need dependencies installed first - you can try in
 {skills_summary}""")
         
         return "\n\n---\n\n".join(parts)
+
+    def load_user_memory_context(self, user_key: str | None) -> str:
+        """Load per-user memory context from memory/users/<user_key>/MEMORY.md."""
+        if not user_key:
+            return ""
+        memory = MemoryStore(self.workspace, user_key=user_key).get_memory_context()
+        return memory
     
     def _get_identity(self) -> str:
         """Get the core identity section."""
@@ -87,8 +94,8 @@ You are nanobot, a helpful AI assistant.
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable)
+- Long-term memory (global fallback): {workspace_path}/memory/MEMORY.md
+- History log (global fallback): {workspace_path}/memory/HISTORY.md (grep-searchable)
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel.
@@ -101,8 +108,11 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 - If a tool call fails, analyze the error before retrying with a different approach.
 
 ## Memory
-- Remember important facts: write to {workspace_path}/memory/MEMORY.md
-- Recall past events: grep {workspace_path}/memory/HISTORY.md"""
+- Preferred per-user memory path: {workspace_path}/memory/users/{{user_key}}/MEMORY.md
+- Preferred per-user history path: {workspace_path}/memory/users/{{user_key}}/HISTORY.md
+- If user_key is unavailable, use global fallback:
+  - Write facts to {workspace_path}/memory/MEMORY.md
+  - Recall events from {workspace_path}/memory/HISTORY.md"""
 
     @staticmethod
     def _inject_runtime_context(
@@ -141,6 +151,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        user_key: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -160,6 +171,9 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
         # System prompt
         system_prompt = self.build_system_prompt(skill_names)
+        user_memory = self.load_user_memory_context(user_key)
+        if user_memory:
+            system_prompt += f"\n\n## User Memory ({user_key})\n{user_memory}"
         messages.append({"role": "system", "content": system_prompt})
 
         # History
