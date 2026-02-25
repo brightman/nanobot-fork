@@ -1,0 +1,19 @@
+{
+  "company": "",
+  "role": "",
+  "pains": [],
+  "budget_signal": "",
+  "timeline": "",
+  "objections": [],
+  "next_step": "",
+  "updated_at": "",
+  "confidence": {
+    "company": 0.0,
+    "role": 0.0,
+    "pains": 0.0,
+    "budget_signal": 0.0,
+    "timeline": 0.0,
+    "objections": 0.0,
+    "next_step": 0.0
+  }
+}

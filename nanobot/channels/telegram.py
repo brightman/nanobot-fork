@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+import shutil
+import subprocess
+from pathlib import Path
 from loguru import logger
 from telegram import BotCommand, Update, ReplyParameters
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -113,6 +116,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("new", "Start a new conversation"),
         BotCommand("help", "Show available commands"),
     ]
+    MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
     
     def __init__(
         self,
@@ -151,7 +155,15 @@ class TelegramChannel(BaseChannel):
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
             MessageHandler(
-                (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL) 
+                (
+                    filters.TEXT
+                    | filters.PHOTO
+                    | filters.VOICE
+                    | filters.AUDIO
+                    | filters.VIDEO
+                    | filters.VIDEO_NOTE
+                    | filters.Document.ALL
+                )
                 & ~filters.COMMAND, 
                 self._on_message
             )
@@ -208,7 +220,46 @@ class TelegramChannel(BaseChannel):
             return "voice"
         if ext in ("mp3", "m4a", "wav", "aac"):
             return "audio"
+        if ext in ("mp4", "mov", "mkv", "webm"):
+            return "video"
         return "document"
+
+    @staticmethod
+    def _media_workspace_dir() -> Path:
+        media_dir = Path.home() / ".nanobot" / "workspace" / "media"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        return media_dir
+
+    @staticmethod
+    def _human_size(size: int) -> str:
+        if size >= 1024 * 1024:
+            return f"{size / (1024 * 1024):.1f}MB"
+        if size >= 1024:
+            return f"{size / 1024:.1f}KB"
+        return f"{size}B"
+
+    def _is_media_too_large(self, media_file) -> bool:
+        size = getattr(media_file, "file_size", None)
+        return bool(size and size > self.MAX_DOWNLOAD_BYTES)
+
+    def _extract_audio_from_video(self, video_path: Path) -> Path | None:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return None
+
+        audio_path = video_path.with_suffix(".mp3")
+        cmd = [
+            ffmpeg, "-y", "-i", str(video_path), "-vn", "-acodec", "libmp3lame", "-ar", "16000", str(audio_path),
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                logger.warning("Failed to extract audio from {}: {}", video_path, result.stderr[-200:])
+                return None
+            return audio_path
+        except Exception as e:
+            logger.warning("Failed to run ffmpeg for {}: {}", video_path, e)
+            return None
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Telegram."""
@@ -241,8 +292,13 @@ class TelegramChannel(BaseChannel):
                     "photo": self._app.bot.send_photo,
                     "voice": self._app.bot.send_voice,
                     "audio": self._app.bot.send_audio,
+                    "video": self._app.bot.send_video,
                 }.get(media_type, self._app.bot.send_document)
-                param = "photo" if media_type == "photo" else media_type if media_type in ("voice", "audio") else "document"
+                param = (
+                    "photo" if media_type == "photo"
+                    else media_type if media_type in ("voice", "audio", "video")
+                    else "document"
+                )
                 with open(media_path, 'rb') as f:
                     await sender(
                         chat_id=chat_id, 
@@ -319,7 +375,7 @@ class TelegramChannel(BaseChannel):
         )
     
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle incoming messages (text, photos, voice, documents)."""
+        """Handle incoming messages (text and media)."""
         if not update.message or not update.effective_user:
             return
         
@@ -354,6 +410,12 @@ class TelegramChannel(BaseChannel):
         elif message.audio:
             media_file = message.audio
             media_type = "audio"
+        elif message.video:
+            media_file = message.video
+            media_type = "video"
+        elif message.video_note:
+            media_file = message.video_note
+            media_type = "video_note"
         elif message.document:
             media_file = message.document
             media_type = "file"
@@ -361,33 +423,54 @@ class TelegramChannel(BaseChannel):
         # Download media if present
         if media_file and self._app:
             try:
-                file = await self._app.bot.get_file(media_file.file_id)
-                ext = self._get_extension(media_type, getattr(media_file, 'mime_type', None))
-                
-                # Save to workspace/media/
-                from pathlib import Path
-                media_dir = Path.home() / ".nanobot" / "media"
-                media_dir.mkdir(parents=True, exist_ok=True)
-                
-                file_path = media_dir / f"{media_file.file_id[:16]}{ext}"
-                await file.download_to_drive(str(file_path))
-                
-                media_paths.append(str(file_path))
-                
-                # Handle voice transcription
-                if media_type == "voice" or media_type == "audio":
-                    from nanobot.providers.transcription import GroqTranscriptionProvider
-                    transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
-                    transcription = await transcriber.transcribe(file_path)
-                    if transcription:
-                        logger.info("Transcribed {}: {}...", media_type, transcription[:50])
-                        content_parts.append(f"[transcription: {transcription}]")
+                if self._is_media_too_large(media_file):
+                    size = getattr(media_file, "file_size", 0)
+                    logger.warning(
+                        "Skip oversized Telegram {} file {} (max {})",
+                        media_type,
+                        self._human_size(size),
+                        self._human_size(self.MAX_DOWNLOAD_BYTES),
+                    )
+                    content_parts.append(
+                        f"[{media_type}: file too large ({self._human_size(size)} > {self._human_size(self.MAX_DOWNLOAD_BYTES)})]"
+                    )
+                else:
+                    file = await self._app.bot.get_file(media_file.file_id)
+                    ext = self._get_extension(media_type, getattr(media_file, 'mime_type', None))
+
+                    media_dir = self._media_workspace_dir()
+                    file_path = media_dir / f"{media_file.file_id[:16]}{ext}"
+                    await file.download_to_drive(str(file_path))
+                    
+                    media_paths.append(str(file_path))
+                    
+                    # Handle voice transcription
+                    if media_type in ("voice", "audio"):
+                        from nanobot.providers.transcription import GroqTranscriptionProvider
+                        transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
+                        transcription = await transcriber.transcribe(file_path)
+                        if transcription:
+                            logger.info("Transcribed {}: {}...", media_type, transcription[:50])
+                            content_parts.append(f"[transcription: {transcription}]")
+                        else:
+                            content_parts.append(f"[{media_type}: {file_path}]")
+                    elif media_type in ("video", "video_note"):
+                        audio_path = self._extract_audio_from_video(file_path)
+                        if audio_path:
+                            from nanobot.providers.transcription import GroqTranscriptionProvider
+                            transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
+                            transcription = await transcriber.transcribe(audio_path)
+                            if transcription:
+                                logger.info("Transcribed {} audio: {}...", media_type, transcription[:50])
+                                content_parts.append(f"[transcription: {transcription}]")
+                            else:
+                                content_parts.append(f"[{media_type}: {file_path}]")
+                        else:
+                            content_parts.append(f"[{media_type}: {file_path}]")
                     else:
                         content_parts.append(f"[{media_type}: {file_path}]")
-                else:
-                    content_parts.append(f"[{media_type}: {file_path}]")
-                    
-                logger.debug("Downloaded {} to {}", media_type, file_path)
+                        
+                    logger.debug("Downloaded {} to {}", media_type, file_path)
             except Exception as e:
                 logger.error("Failed to download media: {}", e)
                 content_parts.append(f"[{media_type}: download failed]")
@@ -412,7 +495,8 @@ class TelegramChannel(BaseChannel):
                 "user_id": user.id,
                 "username": user.username,
                 "first_name": user.first_name,
-                "is_group": message.chat.type != "private"
+                "is_group": message.chat.type != "private",
+                "msg_type": media_type or ("text" if message.text else "unknown"),
             }
         )
     
@@ -449,9 +533,10 @@ class TelegramChannel(BaseChannel):
             ext_map = {
                 "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
                 "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
+                "video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov",
             }
             if mime_type in ext_map:
                 return ext_map[mime_type]
         
-        type_map = {"image": ".jpg", "voice": ".ogg", "audio": ".mp3", "file": ""}
+        type_map = {"image": ".jpg", "voice": ".ogg", "audio": ".mp3", "video": ".mp4", "video_note": ".mp4", "file": ""}
         return type_map.get(media_type, "")

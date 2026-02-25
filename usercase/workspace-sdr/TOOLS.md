@@ -13,4 +13,3 @@ This file documents non-obvious constraints and usage patterns.
 ## cron — Scheduled Reminders
 
 - Please refer to cron skill for usage.
-<!-- external upgrade e2e test -->
