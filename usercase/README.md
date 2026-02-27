@@ -8,6 +8,7 @@ This usercase demonstrates how to run nanobot as an AI SDR with per-customer iso
 - `AGENTS.md`: SDR operating policy, qualification fields, handoff rules
 - `SOUL.md`: SDR identity, values, communication style
 - `USER.md`: product profile for selling `nanobot` (Data Intelligence Lab @ HKU)
+- `agents/`: Claude-style subagent profiles (`*.md` frontmatter)
 - `skills/sdr-memory/`: structured profile skill and scripts
 
 2. Per-user memory + sales conversion demonstration:
@@ -29,4 +30,12 @@ python3 "$SCRIPT" ensure --workspace usercase/workspace-sdr --channel telegram -
 python3 "$SCRIPT" upsert-profile --workspace usercase/workspace-sdr --channel telegram --sender-id "10001|alice" \
   --json '{"company":"ACME","role":"Head of Sales","pains":["manual follow-ups"],"budget_signal":"active","timeline":"this quarter","objections":["integration effort"],"next_step":"book 30-min demo"}'
 python3 "$SCRIPT" get-profile --workspace usercase/workspace-sdr --channel telegram --sender-id "10001|alice"
+```
+
+## Subagent quick test
+
+```bash
+cd nanobot
+nanobot subagents list
+nanobot subagents run --agent sdr_researcher --task "Research HKUDS nanobot project context for SDR outreach."
 ```

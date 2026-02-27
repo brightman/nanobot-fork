@@ -603,6 +603,176 @@ def agent(
 # Channel Commands
 # ============================================================================
 
+agents_app = typer.Typer(
+    help="Manage and chat with subagent profiles",
+    invoke_without_command=True,
+)
+app.add_typer(agents_app, name="agents")
+
+
+def _build_subagent_manager():
+    from nanobot.config.loader import load_config
+    from nanobot.bus.queue import MessageBus
+    from nanobot.agent.subagent import SubagentManager
+
+    config = load_config()
+    manager = SubagentManager(
+        provider=_make_provider(config),
+        workspace=config.workspace_path,
+        bus=MessageBus(),
+        model=config.agents.defaults.model,
+        temperature=config.agents.defaults.temperature,
+        max_tokens=config.agents.defaults.max_tokens,
+        brave_api_key=config.tools.web.search.api_key or None,
+        exec_config=config.tools.exec,
+        restrict_to_workspace=config.tools.restrict_to_workspace,
+    )
+    return config, manager
+
+
+def _print_agents_list(manager) -> None:
+    defs = manager.list_definitions()
+    if not defs:
+        console.print("[yellow]No subagent profiles found.[/yellow]")
+        console.print("Create markdown files under: [cyan]~/.nanobot/agents[/cyan]")
+        return
+    console.print("[cyan]SubAgents[/cyan]")
+    for d in defs:
+        console.print(f"  {d.name}")
+
+
+def _run_subagent_chat(manager, agent: str, markdown: bool = True) -> None:
+    """Start an interactive continuous chat with one selected subagent."""
+    _init_prompt_session()
+    console.print(
+        f"{__logo__} Subagent chat mode: [cyan]{agent}[/cyan] "
+        "(Ctrl+C to quit, [bold]/new[/bold] to reset)\n"
+    )
+
+    async def _chat():
+        while True:
+            try:
+                user_input = await _read_interactive_input_async()
+                command = user_input.strip()
+                if not command:
+                    continue
+                with console.status(f"[dim]{agent} is thinking...[/dim]", spinner="dots"):
+                    result, status = await manager.chat_turn(agent=agent, user_input=user_input, session_id="cli")
+                if isinstance(result, str):
+                    low = result.lower()
+                    if low.startswith("error calling llm:"):
+                        status = "error"
+                console.print()
+                console.print(f"[cyan]{agent} ({status})[/cyan]")
+                if markdown:
+                    console.print(Markdown(result))
+                else:
+                    console.print(result)
+                console.print()
+            except KeyboardInterrupt:
+                console.print("\nGoodbye!")
+                break
+            except EOFError:
+                console.print("\nGoodbye!")
+                break
+
+    asyncio.run(_chat())
+
+
+@agents_app.callback()
+def agents_root(ctx: typer.Context):
+    """List subagents and choose one to enter chat when running `nanobot agents`."""
+    if ctx.invoked_subcommand is not None:
+        return
+    _, manager = _build_subagent_manager()
+    defs = manager.list_definitions()
+    if not defs:
+        _print_agents_list(manager)
+        return
+
+    console.print("[cyan]SubAgents[/cyan]")
+    for idx, d in enumerate(defs, start=1):
+        console.print(f"  {idx}. {d.name}")
+
+    while True:
+        try:
+            selected = typer.prompt("Select subagent (name or number)")
+        except (KeyboardInterrupt, EOFError):
+            console.print("\nGoodbye!")
+            return
+        value = selected.strip()
+        if not value:
+            continue
+        chosen_name: str | None = None
+        if value.isdigit():
+            i = int(value)
+            if 1 <= i <= len(defs):
+                chosen_name = defs[i - 1].name
+        else:
+            if any(d.name == value for d in defs):
+                chosen_name = value
+        if chosen_name:
+            _run_subagent_chat(manager, chosen_name, markdown=True)
+            return
+        console.print("[yellow]Invalid selection. Please enter a valid name or number.[/yellow]")
+
+
+@agents_app.command("list")
+def agents_list():
+    """List available subagent profiles (~/.nanobot/agents + workspace overrides)."""
+    _, manager = _build_subagent_manager()
+    _print_agents_list(manager)
+
+
+@agents_app.command("run")
+def agents_run(
+    task: str = typer.Option(..., "--task", "-t", help="Task for the subagent"),
+    agent: str = typer.Option(..., "--agent", "-a", help="Subagent profile name"),
+    markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render output as Markdown"),
+):
+    """Run one subagent profile directly (single-shot)."""
+    config, manager = _build_subagent_manager()
+    if not manager.get_definition(agent):
+        console.print(f"[red]Subagent profile not found:[/red] {agent}")
+        console.print("Expected under: [cyan]~/.nanobot/agents[/cyan] (or workspace/agents override)")
+        raise typer.Exit(1)
+
+    async def _run():
+        with console.status(f"[dim]Subagent {agent} is running...[/dim]", spinner="dots"):
+            result, status = await manager.run_once(task=task, agent=agent)
+        if isinstance(result, str):
+            low = result.lower()
+            if low.startswith("error calling llm:") or "returned an empty response" in low:
+                status = "error"
+        title = f"Subagent {agent} ({status})"
+        console.print(f"\n[cyan]{title}[/cyan]")
+        if markdown:
+            console.print(Markdown(result))
+        else:
+            console.print(result)
+        console.print()
+
+    asyncio.run(_run())
+
+
+@agents_app.command("chat")
+def agents_chat(
+    agent: str = typer.Option(..., "--agent", "-a", help="Subagent profile name"),
+    markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render output as Markdown"),
+):
+    """Open a continuous interactive chat with one selected subagent."""
+    _, manager = _build_subagent_manager()
+    if not manager.get_definition(agent):
+        console.print(f"[red]Subagent profile not found:[/red] {agent}")
+        console.print("Expected under: [cyan]~/.nanobot/agents[/cyan] (or workspace/agents override)")
+        raise typer.Exit(1)
+    _run_subagent_chat(manager, agent, markdown=markdown)
+
+
+# ============================================================================
+# Channel Commands
+# ============================================================================
+
 
 channels_app = typer.Typer(help="Manage channels")
 app.add_typer(channels_app, name="channels")

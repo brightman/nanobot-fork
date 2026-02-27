@@ -89,6 +89,7 @@ class AgentLoop:
             brave_api_key=brave_api_key,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
+            parent_tools=self.tools,
         )
 
         self._running = False
@@ -363,6 +364,38 @@ class AgentLoop:
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
+
+        # Claude-style auto-routing: if a subagent profile clearly matches the task,
+        # execute it directly and return the result in this turn.
+        bypass_subagent = msg.content.lstrip().startswith("!main ")
+        user_content_for_routing = msg.content.lstrip()[6:] if bypass_subagent else msg.content
+        routed, route_reason = (None, "bypass-main") if bypass_subagent else await self.subagents.route(user_content_for_routing)
+        if routed is not None:
+            logger.info("Auto-routed task to subagent profile '{}' ({})", routed.name, route_reason)
+            if on_progress:
+                await on_progress(f"Routing task to subagent '{routed.name}' ({route_reason})")
+            result, status = await self.subagents.run_once(task=user_content_for_routing, agent=routed.name)
+            session.add_message("user", user_content_for_routing, user_key=user_key)
+            session.add_message(
+                "assistant",
+                result,
+                user_key=user_key,
+                subagent=routed.name,
+                status=status,
+                route_reason=route_reason,
+            )
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=result,
+                metadata={
+                    **(msg.metadata or {}),
+                    "subagent": routed.name,
+                    "subagent_status": status,
+                    "subagent_route_reason": route_reason,
+                },
+            )
 
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):

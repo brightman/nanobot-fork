@@ -18,6 +18,106 @@
 
 📏 Real-time line count: **3,966 lines** (run `bash core_agent_lines.sh` to verify anytime)
 
+## 🍴 Nanobot-fork (Brightman)
+
+### 1) What is nanobot + original repository
+
+- nanobot is an ultra-lightweight, open-source AI assistant framework from **Data Intelligence Lab @ HKU**.
+- Original upstream repository: [HKUDS/nanobot](https://github.com/HKUDS/nanobot)
+- This repository is a fork for scenario-focused upgrades and rapid iteration.
+
+### 2) Why this fork
+
+This fork is focused on productization scenarios beyond a single personal assistant:
+
+1. Upgrade from pure 1v1 personal assistant to both:
+   - **1v1** assistant use cases
+   - **1vN** business use cases such as **Customer Support (CS)** and **Sales Development (SDR)**
+2. Add Claude Code-style capabilities around:
+   - **Sub Agent**
+   - **Skills**
+   - Foundation for **Agent Team** workflows
+
+### 3) Fork update notes (features, config, CLI usage)
+
+This section tracks fork-specific upgrades and how to use them.
+
+#### 3.1 Sub Agent system (Claude-style direction)
+
+- Added subagent profile loading from:
+  - Global: `~/.nanobot/agents/*.md`
+  - Workspace override: `<workspace>/agents/*.md`
+- Added semantic routing in main agent:
+  - Main agent first decides `main` vs `subagent`
+  - Rule-based fallback if routing output is invalid
+- Added Sub Agent config options in frontmatter:
+  - `spawn` (default `false`)
+  - `skills` (configured skill list, injected into subagent prompt)
+  - `mcp` (`false | true | ["server"] | ["mcp_server_tool"]`)
+
+Example subagent profile:
+
+```md
+---
+name: sdr_researcher
+description: Research prospect context and prepare concise SDR notes.
+tools: [read_file, list_dir, web_search, web_fetch]
+disallowedTools: [exec, write_file, edit_file]
+maxTurns: 8
+spawn: false
+skills: [sdr-memory]
+mcp: false
+systemPrompt: |
+  You are an SDR research subagent.
+---
+```
+
+#### 3.2 CLI upgrades for agents
+
+- `nanobot agents`
+  - Lists subagents from `~/.nanobot/agents`
+  - Lets you select one by name/number
+  - Enters continuous chat with selected subagent
+- `nanobot agents list`
+  - List available subagents
+- `nanobot agents run --agent <name> --task "<task>"`
+  - Single-shot execution
+- `nanobot agents chat --agent <name>`
+  - Continuous chat mode
+
+#### 3.3 Per-user memory + SDR scenario support
+
+- Per-user memory isolation under:
+  - `memory/users/<user_key>/MEMORY.md`
+  - `memory/users/<user_key>/HISTORY.md`
+- Added structured SDR memory skill:
+  - `PROFILE.json` with:
+    - `company`, `role`, `pains`, `budget_signal`, `timeline`, `objections`, `next_step`
+- Added usercase example workspace:
+  - `usercase/workspace-sdr/`
+
+#### 3.4 Channel and provider compatibility fixes
+
+- DingTalk channel:
+  - Added inbound voice-message handling
+  - Optional transcription path
+  - Fail-open behavior for download/transcription failures
+- Bedrock/OpenRouter compatibility:
+  - Tool names are normalized to safe identifiers (`[a-zA-Z0-9_-]`) before model calls
+
+#### 3.5 Quick commands for this fork
+
+```bash
+# interactive main agent
+nanobot agent
+
+# list/select/chat with subagents
+nanobot agents
+
+# single-shot subagent run
+nanobot agents run --agent sdr_researcher --task "Research HKUDS nanobot project context for SDR outreach."
+```
+
 ## 📢 News
 
 - **2026-02-24** 🚀 Released **v0.1.4.post2** — a reliability-focused release with a redesigned heartbeat, prompt cache optimization, and hardened provider & channel stability. See [release notes](https://github.com/HKUDS/nanobot/releases/tag/v0.1.4.post2) for details.
