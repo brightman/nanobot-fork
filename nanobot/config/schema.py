@@ -49,6 +49,9 @@ class DingTalkConfig(Base):
     client_id: str = ""  # AppKey
     client_secret: str = ""  # AppSecret
     allow_from: list[str] = Field(default_factory=list)  # Allowed staff_ids
+    enable_media_receive: bool = True  # Enable inbound media parsing (voice/audio)
+    enable_voice_transcription: bool = True  # Transcribe inbound voice via Groq when possible
+    max_download_bytes: int = 20 * 1024 * 1024  # Max media download size
 
 
 class DiscordConfig(Base):

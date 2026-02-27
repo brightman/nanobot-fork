@@ -3,7 +3,9 @@
 import asyncio
 import json
 import time
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from loguru import logger
 import httpx
@@ -48,30 +50,32 @@ class NanobotDingTalkHandler(CallbackHandler):
         try:
             # Parse using SDK's ChatbotMessage for robust handling
             chatbot_msg = ChatbotMessage.from_dict(message.data)
+            content, media_paths, msg_type = await self.channel._extract_inbound_message(chatbot_msg, message.data)
+            sender_id = str(chatbot_msg.sender_staff_id or chatbot_msg.sender_id or "unknown")
+            sender_name = str(chatbot_msg.sender_nick or "Unknown")
 
-            # Extract text content; fall back to raw dict if SDK object is empty
-            content = ""
-            if chatbot_msg.text:
-                content = chatbot_msg.text.content.strip()
-            if not content:
-                content = message.data.get("text", {}).get("content", "").strip()
-
-            if not content:
-                logger.warning(
-                    "Received empty or unsupported message type: {}",
-                    chatbot_msg.message_type,
-                )
+            if not content and not media_paths:
+                logger.warning("Received empty or unsupported DingTalk message type: {}", msg_type)
                 return AckMessage.STATUS_OK, "OK"
 
-            sender_id = chatbot_msg.sender_staff_id or chatbot_msg.sender_id
-            sender_name = chatbot_msg.sender_nick or "Unknown"
-
-            logger.info("Received DingTalk message from {} ({}): {}", sender_name, sender_id, content)
+            logger.info(
+                "Received DingTalk {} from {} ({}), media={}",
+                msg_type,
+                sender_name,
+                sender_id,
+                len(media_paths),
+            )
 
             # Forward to Nanobot via _on_message (non-blocking).
             # Store reference to prevent GC before task completes.
             task = asyncio.create_task(
-                self.channel._on_message(content, sender_id, sender_name)
+                self.channel._on_message(
+                    content,
+                    sender_id,
+                    sender_name,
+                    media=media_paths,
+                    metadata={"msg_type": msg_type},
+                )
             )
             self.channel._background_tasks.add(task)
             task.add_done_callback(self.channel._background_tasks.discard)
@@ -97,11 +101,12 @@ class DingTalkChannel(BaseChannel):
 
     name = "dingtalk"
 
-    def __init__(self, config: DingTalkConfig, bus: MessageBus):
+    def __init__(self, config: DingTalkConfig, bus: MessageBus, groq_api_key: str = ""):
         super().__init__(config, bus)
         self.config: DingTalkConfig = config
         self._client: Any = None
         self._http: httpx.AsyncClient | None = None
+        self.groq_api_key: str = groq_api_key
 
         # Access Token management for sending messages
         self._access_token: str | None = None
@@ -163,6 +168,177 @@ class DingTalkChannel(BaseChannel):
         for task in self._background_tasks:
             task.cancel()
         self._background_tasks.clear()
+
+    @staticmethod
+    def _media_workspace_dir() -> Path:
+        media_dir = Path.home() / ".nanobot" / "workspace" / "media"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        return media_dir
+
+    @staticmethod
+    def _safe_text(value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    @staticmethod
+    def _extract_message_type(chatbot_msg: Any, raw_data: dict[str, Any]) -> str:
+        msg_type = (
+            getattr(chatbot_msg, "message_type", None)
+            or raw_data.get("messageType")
+            or raw_data.get("msgtype")
+            or raw_data.get("msg_type")
+            or "unknown"
+        )
+        return str(msg_type).strip().lower()
+
+    @classmethod
+    def _extract_text_content(cls, chatbot_msg: Any, raw_data: dict[str, Any]) -> str:
+        text_obj = getattr(chatbot_msg, "text", None)
+        if text_obj and getattr(text_obj, "content", None):
+            return cls._safe_text(text_obj.content)
+        return cls._safe_text(raw_data.get("text", {}).get("content", ""))
+
+    @classmethod
+    def _find_first_url(cls, obj: Any) -> str:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                key_l = str(key).lower()
+                if isinstance(value, str):
+                    v = value.strip()
+                    if v.startswith(("http://", "https://")) and (
+                        "url" in key_l or "download" in key_l or "media" in key_l
+                    ):
+                        return v
+                found = cls._find_first_url(value)
+                if found:
+                    return found
+            return ""
+        if isinstance(obj, list):
+            for item in obj:
+                found = cls._find_first_url(item)
+                if found:
+                    return found
+        return ""
+
+    @classmethod
+    def _find_first_transcript(cls, obj: Any) -> str:
+        keys = {"recognition", "speechtext", "transcript", "asrtext", "asr_text"}
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if str(key).lower() in keys and isinstance(value, str) and value.strip():
+                    return value.strip()
+                found = cls._find_first_transcript(value)
+                if found:
+                    return found
+            return ""
+        if isinstance(obj, list):
+            for item in obj:
+                found = cls._find_first_transcript(item)
+                if found:
+                    return found
+        return ""
+
+    async def _download_voice_media(self, url: str) -> str | None:
+        if not url:
+            return None
+
+        parsed = urlparse(url)
+        ext = Path(parsed.path).suffix.lower() or ".amr"
+        filename = f"dingtalk_voice_{int(time.time() * 1000)}{ext}"
+        file_path = self._media_workspace_dir() / filename
+
+        created_client = False
+        client = self._http
+        if client is None:
+            client = httpx.AsyncClient()
+            created_client = True
+
+        try:
+            head = await client.head(url, timeout=15.0)
+            if head.status_code < 400:
+                content_length = int(head.headers.get("content-length", "0") or "0")
+                if content_length and content_length > self.config.max_download_bytes:
+                    logger.warning(
+                        "DingTalk voice download skipped: {} > {} bytes",
+                        content_length,
+                        self.config.max_download_bytes,
+                    )
+                    return None
+
+            resp = await client.get(url, timeout=30.0)
+            if resp.status_code >= 400:
+                logger.warning("DingTalk voice download failed: status={} url={}", resp.status_code, url)
+                return None
+            if len(resp.content) > self.config.max_download_bytes:
+                logger.warning(
+                    "DingTalk voice download skipped after fetch: {} > {} bytes",
+                    len(resp.content),
+                    self.config.max_download_bytes,
+                )
+                return None
+            file_path.write_bytes(resp.content)
+            return str(file_path)
+        except Exception as e:
+            logger.warning("DingTalk voice download error: {}", e)
+            return None
+        finally:
+            if created_client:
+                await client.aclose()
+
+    async def _transcribe_voice(self, media_path: str) -> str:
+        if not self.config.enable_voice_transcription:
+            return ""
+        try:
+            from nanobot.providers.transcription import GroqTranscriptionProvider
+
+            provider = GroqTranscriptionProvider(api_key=self.groq_api_key)
+            return await provider.transcribe(media_path)
+        except Exception as e:
+            logger.warning("DingTalk voice transcription failed: {}", e)
+            return ""
+
+    async def _extract_inbound_message(self, chatbot_msg: Any, raw_data: dict[str, Any]) -> tuple[str, list[str], str]:
+        """Extract text/media from inbound DingTalk event with fail-open behavior."""
+        msg_type = self._extract_message_type(chatbot_msg, raw_data)
+        content_parts: list[str] = []
+        media_paths: list[str] = []
+
+        text_content = self._extract_text_content(chatbot_msg, raw_data)
+        if text_content:
+            content_parts.append(text_content)
+
+        if not self.config.enable_media_receive:
+            content = "\n".join([p for p in content_parts if p]).strip()
+            return content, media_paths, msg_type
+
+        voice_types = {"audio", "voice", "audio_message"}
+        if msg_type in voice_types:
+            voice_url = self._find_first_url(raw_data)
+            transcript = self._find_first_transcript(raw_data)
+
+            if voice_url:
+                media_path = await self._download_voice_media(voice_url)
+                if media_path:
+                    media_paths.append(media_path)
+                    if transcript:
+                        content_parts.append(f"[transcription: {transcript}]")
+                    else:
+                        auto_transcript = await self._transcribe_voice(media_path)
+                        if auto_transcript:
+                            content_parts.append(f"[transcription: {auto_transcript}]")
+                        else:
+                            content_parts.append(f"[voice: {media_path}]")
+                else:
+                    content_parts.append("[voice message received: download failed]")
+            else:
+                if transcript:
+                    content_parts.append(f"[transcription: {transcript}]")
+                else:
+                    content_parts.append("[voice message received]")
+
+        content = "\n".join([p for p in content_parts if p]).strip()
+        return content, media_paths, msg_type
 
     async def _get_access_token(self) -> str | None:
         """Get or refresh Access Token."""
@@ -226,7 +402,14 @@ class DingTalkChannel(BaseChannel):
         except Exception as e:
             logger.error("Error sending DingTalk message: {}", e)
 
-    async def _on_message(self, content: str, sender_id: str, sender_name: str) -> None:
+    async def _on_message(
+        self,
+        content: str,
+        sender_id: str,
+        sender_name: str,
+        media: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Handle incoming message (called by NanobotDingTalkHandler).
 
         Delegates to BaseChannel._handle_message() which enforces allow_from
@@ -238,9 +421,11 @@ class DingTalkChannel(BaseChannel):
                 sender_id=sender_id,
                 chat_id=sender_id,  # For private chat, chat_id == sender_id
                 content=str(content),
+                media=media or [],
                 metadata={
                     "sender_name": sender_name,
                     "platform": "dingtalk",
+                    **(metadata or {}),
                 },
             )
         except Exception as e:
