@@ -44,7 +44,7 @@ def _validate_url(url: str) -> tuple[bool, str]:
 
 
 class WebSearchTool(Tool):
-    """Search the web using Brave Search API."""
+    """Search the web using configured provider (Brave or Tavily)."""
     
     name = "web_search"
     description = "Search the web. Returns titles, URLs, and snippets."
@@ -57,46 +57,96 @@ class WebSearchTool(Tool):
         "required": ["query"]
     }
     
-    def __init__(self, api_key: str | None = None, max_results: int = 5):
+    def __init__(self, api_key: str | None = None, max_results: int = 5, provider: str = "brave"):
         self._init_api_key = api_key
         self.max_results = max_results
+        self.provider = (provider or "brave").strip().lower()
 
-    @property
-    def api_key(self) -> str:
+    def _resolve_provider(self) -> str:
+        p = self.provider
+        if p in {"brave", "tavily"}:
+            return p
+        # Conservative fallback keeps old behavior.
+        return "brave"
+
+    def _resolve_api_key(self, provider: str) -> str:
         """Resolve API key at call time so env/config changes are picked up."""
-        return self._init_api_key or os.environ.get("BRAVE_API_KEY", "")
+        if self._init_api_key:
+            return self._init_api_key
+        if provider == "tavily":
+            return os.environ.get("TAVILY_API_KEY", "")
+        return os.environ.get("BRAVE_API_KEY", "")
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
-        if not self.api_key:
+        provider = self._resolve_provider()
+        api_key = self._resolve_api_key(provider)
+        if not api_key:
+            if provider == "tavily":
+                return (
+                    "Error: Tavily API key not configured. "
+                    "Set it in ~/.nanobot/config.json under tools.web.search.apiKey "
+                    "(or export TAVILY_API_KEY), then restart the gateway."
+                )
             return (
                 "Error: Brave Search API key not configured. "
                 "Set it in ~/.nanobot/config.json under tools.web.search.apiKey "
                 "(or export BRAVE_API_KEY), then restart the gateway."
             )
-        
+
         try:
             n = min(max(count or self.max_results, 1), 10)
-            async with httpx.AsyncClient() as client:
-                r = await client.get(
-                    "https://api.search.brave.com/res/v1/web/search",
-                    params={"q": query, "count": n},
-                    headers={"Accept": "application/json", "X-Subscription-Token": api_key},
-                    timeout=10.0
-                )
-                r.raise_for_status()
-            
-            results = r.json().get("web", {}).get("results", [])
-            if not results:
-                return f"No results for: {query}"
-            
-            lines = [f"Results for: {query}\n"]
-            for i, item in enumerate(results[:n], 1):
-                lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
-                if desc := item.get("description"):
-                    lines.append(f"   {desc}")
-            return "\n".join(lines)
+            if provider == "tavily":
+                return await self._search_tavily(query=query, count=n, api_key=api_key)
+            return await self._search_brave(query=query, count=n, api_key=api_key)
         except Exception as e:
             return f"Error: {e}"
+
+    async def _search_brave(self, query: str, count: int, api_key: str) -> str:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": query, "count": count},
+                headers={"Accept": "application/json", "X-Subscription-Token": api_key},
+                timeout=10.0,
+            )
+            r.raise_for_status()
+
+        results = r.json().get("web", {}).get("results", [])
+        if not results:
+            return f"No results for: {query}"
+
+        lines = [f"Results for: {query}\n"]
+        for i, item in enumerate(results[:count], 1):
+            lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
+            if desc := item.get("description"):
+                lines.append(f"   {desc}")
+        return "\n".join(lines)
+
+    async def _search_tavily(self, query: str, count: int, api_key: str) -> str:
+        payload = {
+            "query": query,
+            "max_results": count,
+            "search_depth": "basic",
+        }
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                "https://api.tavily.com/search",
+                json=payload,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                timeout=15.0,
+            )
+            r.raise_for_status()
+
+        results = r.json().get("results", [])
+        if not results:
+            return f"No results for: {query}"
+
+        lines = [f"Results for: {query}\n"]
+        for i, item in enumerate(results[:count], 1):
+            lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
+            if desc := item.get("content"):
+                lines.append(f"   {desc}")
+        return "\n".join(lines)
 
 
 class WebFetchTool(Tool):

@@ -28,14 +28,24 @@ class LLMResponse:
         return len(self.tool_calls) > 0
 
 
+@dataclass
+class StreamChunk:
+    """A single chunk from a streaming LLM response."""
+    type: str  # "text_delta", "thinking_delta", "tool_call_delta", "tool_result", "done"
+    content: str = ""
+    tool_call_id: str = ""
+    tool_name: str = ""
+    tool_args_delta: str = ""
+
+
 class LLMProvider(ABC):
     """
     Abstract base class for LLM providers.
-    
+
     Implementations should handle the specifics of each provider's API
     while maintaining a consistent interface.
     """
-    
+
     def __init__(self, api_key: str | None = None, api_base: str | None = None):
         self.api_key = api_key
         self.api_base = api_base
@@ -104,6 +114,27 @@ class LLMProvider(ABC):
         """
         pass
     
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ):
+        """Stream a chat completion request, yielding StreamChunks.
+
+        Default implementation falls back to non-streaming chat() and yields
+        the full response as a single chunk. Subclasses may override for
+        true token-level streaming.
+        """
+        response = await self.chat(messages, tools, model, max_tokens, temperature)
+        if response.reasoning_content:
+            yield StreamChunk(type="thinking_delta", content=response.reasoning_content)
+        if response.content:
+            yield StreamChunk(type="text_delta", content=response.content)
+        yield StreamChunk(type="done")
+
     @abstractmethod
     def get_default_model(self) -> str:
         """Get the default model for this provider."""
