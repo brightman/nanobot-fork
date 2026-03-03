@@ -36,6 +36,14 @@ python3 "$SCRIPT" get-profile --workspace usercase/workspace-sdr --channel teleg
 
 ```bash
 cd nanobot
-nanobot subagents list
-nanobot subagents run --agent sdr_researcher --task "Research HKUDS nanobot project context for SDR outreach."
+nanobot agents
 ```
+
+## Deep Research Usercase
+
+See `usercase/workspace-deepresearch/` for a complete deep-research multi-agent setup:
+
+- Main orchestrator prompts and policies
+- Specialized subagents (`planner`, `retriever`, `reader`, `evidence_auditor`, `coder_analyst`, `synthesizer`, `critic`, `writer`)
+- Skills for orchestration and source grading
+- MCP server config example

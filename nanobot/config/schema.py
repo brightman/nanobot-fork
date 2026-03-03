@@ -249,6 +249,7 @@ class GatewayConfig(Base):
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
+    provider: str = "brave"  # brave | tavily
     api_key: str = ""  # Brave Search API key
     max_results: int = 5
 

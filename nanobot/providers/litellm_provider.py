@@ -8,7 +8,7 @@ from typing import Any
 import litellm
 from litellm import acompletion
 
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.base import LLMProvider, LLMResponse, StreamChunk, ToolCallRequest
 from nanobot.providers.registry import find_by_model, find_gateway
 
 
@@ -268,6 +268,69 @@ class LiteLLMProvider(LLMProvider):
             reasoning_content=reasoning_content,
         )
     
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ):
+        """Stream a chat completion via LiteLLM, yielding StreamChunks."""
+        original_model = model or self.default_model
+        model = self._resolve_model(original_model)
+
+        if self._supports_cache_control(original_model):
+            messages, tools = self._apply_cache_control(messages, tools)
+
+        max_tokens = max(1, max_tokens)
+
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": self._sanitize_messages(self._sanitize_empty_content(messages)),
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True,
+        }
+        self._apply_model_overrides(model, kwargs)
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
+        if self.extra_headers:
+            kwargs["extra_headers"] = self.extra_headers
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+
+        try:
+            response = await acompletion(**kwargs)
+            async for chunk in response:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta is None:
+                    continue
+                # Text content
+                if hasattr(delta, "content") and delta.content:
+                    yield StreamChunk(type="text_delta", content=delta.content)
+                # Reasoning / thinking content
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    yield StreamChunk(type="thinking_delta", content=reasoning)
+                # Tool calls
+                if hasattr(delta, "tool_calls") and delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        fn = getattr(tc, "function", None)
+                        yield StreamChunk(
+                            type="tool_call_delta",
+                            tool_call_id=getattr(tc, "id", "") or "",
+                            tool_name=getattr(fn, "name", "") or "",
+                            tool_args_delta=getattr(fn, "arguments", "") or "",
+                        )
+            yield StreamChunk(type="done")
+        except Exception as e:
+            yield StreamChunk(type="text_delta", content=f"Error calling LLM: {e}")
+            yield StreamChunk(type="done")
+
     def get_default_model(self) -> str:
         """Get the default model."""
         return self.default_model
