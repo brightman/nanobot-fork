@@ -29,6 +29,7 @@ app = typer.Typer(
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
+_CONFIG_PATH_OVERRIDE: Path | None = None
 
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
@@ -138,14 +139,38 @@ def version_callback(value: bool):
         raise typer.Exit()
 
 
+def _effective_config_path() -> Path:
+    """Return active config path (CLI override or default path)."""
+    if _CONFIG_PATH_OVERRIDE is not None:
+        return _CONFIG_PATH_OVERRIDE
+    from nanobot.config.loader import get_config_path
+
+    return get_config_path()
+
+
+def _load_config() -> Config:
+    """Load config using active path."""
+    from nanobot.config.loader import load_config
+
+    return load_config(_effective_config_path())
+
+
 @app.callback()
 def main(
     version: bool = typer.Option(
         None, "--version", "-v", callback=version_callback, is_eager=True
     ),
+    config: Path | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to config JSON (default: ~/.nanobot/config.json)",
+    ),
 ):
     """nanobot - Personal AI Assistant."""
-    pass
+    global _CONFIG_PATH_OVERRIDE
+    if config is not None:
+        _CONFIG_PATH_OVERRIDE = config.expanduser().resolve()
 
 
 # ============================================================================
@@ -156,11 +181,11 @@ def main(
 @app.command()
 def onboard():
     """Initialize nanobot configuration and workspace."""
-    from nanobot.config.loader import get_config_path, load_config, save_config
+    from nanobot.config.loader import save_config
     from nanobot.config.schema import Config
     from nanobot.utils.helpers import get_workspace_path
-    
-    config_path = get_config_path()
+
+    config_path = _effective_config_path()
     
     if config_path.exists():
         console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
@@ -168,14 +193,14 @@ def onboard():
         console.print("  [bold]N[/bold] = refresh config, keeping existing values and adding new fields")
         if typer.confirm("Overwrite?"):
             config = Config()
-            save_config(config)
+            save_config(config, config_path)
             console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
         else:
-            config = load_config()
-            save_config(config)
+            config = _load_config()
+            save_config(config, config_path)
             console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
     else:
-        save_config(Config())
+        save_config(Config(), config_path)
         console.print(f"[green]✓[/green] Created config at {config_path}")
     
     # Create workspace
@@ -278,7 +303,7 @@ def gateway(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Start the nanobot gateway."""
-    from nanobot.config.loader import load_config, get_data_dir
+    from nanobot.config.loader import get_data_dir
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.loop import AgentLoop
     from nanobot.channels.manager import ChannelManager
@@ -293,7 +318,7 @@ def gateway(
     
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
     
-    config = load_config()
+    config = _load_config()
     bus = MessageBus()
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
@@ -313,6 +338,7 @@ def gateway(
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
+        web_search_provider=config.tools.web.search.provider,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -440,13 +466,13 @@ def agent(
     logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
 ):
     """Interact with the agent directly."""
-    from nanobot.config.loader import load_config, get_data_dir
+    from nanobot.config.loader import get_data_dir
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.loop import AgentLoop
     from nanobot.cron.service import CronService
     from loguru import logger
     
-    config = load_config()
+    config = _load_config()
     
     bus = MessageBus()
     provider = _make_provider(config)
@@ -470,6 +496,7 @@ def agent(
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
+        web_search_provider=config.tools.web.search.provider,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -611,11 +638,14 @@ app.add_typer(agents_app, name="agents")
 
 
 def _build_subagent_manager():
-    from nanobot.config.loader import load_config
+    from nanobot.config.loader import get_data_dir
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.subagent import SubagentManager
+    from nanobot.cron.service import CronService
 
-    config = load_config()
+    config = _load_config()
+    cron_store_path = get_data_dir() / "cron" / "jobs.json"
+    cron = CronService(cron_store_path)
     manager = SubagentManager(
         provider=_make_provider(config),
         workspace=config.workspace_path,
@@ -624,6 +654,8 @@ def _build_subagent_manager():
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         brave_api_key=config.tools.web.search.api_key or None,
+        web_search_provider=config.tools.web.search.provider,
+        cron_service=cron,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
     )
@@ -717,58 +749,6 @@ def agents_root(ctx: typer.Context):
         console.print("[yellow]Invalid selection. Please enter a valid name or number.[/yellow]")
 
 
-@agents_app.command("list")
-def agents_list():
-    """List available subagent profiles (~/.nanobot/agents + workspace overrides)."""
-    _, manager = _build_subagent_manager()
-    _print_agents_list(manager)
-
-
-@agents_app.command("run")
-def agents_run(
-    task: str = typer.Option(..., "--task", "-t", help="Task for the subagent"),
-    agent: str = typer.Option(..., "--agent", "-a", help="Subagent profile name"),
-    markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render output as Markdown"),
-):
-    """Run one subagent profile directly (single-shot)."""
-    config, manager = _build_subagent_manager()
-    if not manager.get_definition(agent):
-        console.print(f"[red]Subagent profile not found:[/red] {agent}")
-        console.print("Expected under: [cyan]~/.nanobot/agents[/cyan] (or workspace/agents override)")
-        raise typer.Exit(1)
-
-    async def _run():
-        with console.status(f"[dim]Subagent {agent} is running...[/dim]", spinner="dots"):
-            result, status = await manager.run_once(task=task, agent=agent)
-        if isinstance(result, str):
-            low = result.lower()
-            if low.startswith("error calling llm:") or "returned an empty response" in low:
-                status = "error"
-        title = f"Subagent {agent} ({status})"
-        console.print(f"\n[cyan]{title}[/cyan]")
-        if markdown:
-            console.print(Markdown(result))
-        else:
-            console.print(result)
-        console.print()
-
-    asyncio.run(_run())
-
-
-@agents_app.command("chat")
-def agents_chat(
-    agent: str = typer.Option(..., "--agent", "-a", help="Subagent profile name"),
-    markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render output as Markdown"),
-):
-    """Open a continuous interactive chat with one selected subagent."""
-    _, manager = _build_subagent_manager()
-    if not manager.get_definition(agent):
-        console.print(f"[red]Subagent profile not found:[/red] {agent}")
-        console.print("Expected under: [cyan]~/.nanobot/agents[/cyan] (or workspace/agents override)")
-        raise typer.Exit(1)
-    _run_subagent_chat(manager, agent, markdown=markdown)
-
-
 # ============================================================================
 # Channel Commands
 # ============================================================================
@@ -781,9 +761,7 @@ app.add_typer(channels_app, name="channels")
 @channels_app.command("status")
 def channels_status():
     """Show channel status."""
-    from nanobot.config.loader import load_config
-
-    config = load_config()
+    config = _load_config()
 
     table = Table(title="Channel Status")
     table.add_column("Channel", style="cyan")
@@ -933,9 +911,8 @@ def _get_bridge_dir() -> Path:
 def channels_login():
     """Link device via QR code."""
     import subprocess
-    from nanobot.config.loader import load_config
-    
-    config = load_config()
+
+    config = _load_config()
     bridge_dir = _get_bridge_dir()
     
     console.print(f"{__logo__} Starting bridge...")
@@ -1111,14 +1088,14 @@ def cron_run(
 ):
     """Manually run a job."""
     from loguru import logger
-    from nanobot.config.loader import load_config, get_data_dir
+    from nanobot.config.loader import get_data_dir
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.loop import AgentLoop
     logger.disable("nanobot")
 
-    config = load_config()
+    config = _load_config()
     provider = _make_provider(config)
     bus = MessageBus()
     agent_loop = AgentLoop(
@@ -1131,6 +1108,7 @@ def cron_run(
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
+        web_search_provider=config.tools.web.search.provider,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
@@ -1166,6 +1144,190 @@ def cron_run(
 
 
 # ============================================================================
+# Trace Commands
+# ============================================================================
+
+trace_app = typer.Typer(help="Inspect runtime traces")
+app.add_typer(trace_app, name="trace")
+
+
+def _resolve_trace_file(workspace: Path, trace_id: str):
+    from nanobot.trace import iter_trace_files
+
+    for p in iter_trace_files(workspace):
+        if p.stem == trace_id or p.name.startswith(trace_id):
+            return p
+    return None
+
+
+def _trace_summary(path: Path) -> dict:
+    from nanobot.trace import read_trace
+
+    rows = read_trace(path)
+    if not rows:
+        return {
+            "trace_id": path.stem,
+            "status": "unknown",
+            "final_contract": "unknown",
+            "elapsed_ms": 0,
+            "session_key": "unknown",
+            "ts": "",
+        }
+    start = rows[0]
+    end = next((r for r in reversed(rows) if r.get("kind") == "run_end"), {})
+    return {
+        "trace_id": start.get("trace_id", path.stem),
+        "status": end.get("status", "running"),
+        "final_contract": end.get("final_contract", "unknown"),
+        "elapsed_ms": end.get("elapsed_ms", 0),
+        "session_key": start.get("session_key", "unknown"),
+        "ts": start.get("ts", ""),
+        "error": end.get("error", ""),
+    }
+
+
+@trace_app.command("latest")
+def trace_latest(
+    limit: int = typer.Option(10, "--limit", "-n", help="Number of recent traces"),
+):
+    """Show latest traces."""
+    from nanobot.trace import iter_trace_files
+
+    config = _load_config()
+    files = iter_trace_files(config.workspace_path)[: max(1, limit)]
+    if not files:
+        console.print("No traces found.")
+        return
+
+    table = Table(title="Recent Traces")
+    table.add_column("Trace ID", style="cyan")
+    table.add_column("Status")
+    table.add_column("Contract")
+    table.add_column("Elapsed(ms)", justify="right")
+    table.add_column("Session")
+    table.add_column("Start Time")
+
+    for f in files:
+        s = _trace_summary(f)
+        table.add_row(
+            s["trace_id"],
+            s["status"],
+            s["final_contract"],
+            str(s["elapsed_ms"]),
+            s["session_key"],
+            s["ts"],
+        )
+    console.print(table)
+
+
+@trace_app.command("show")
+def trace_show(
+    trace_id: str = typer.Argument(..., help="Trace ID"),
+):
+    """Show event timeline for one trace."""
+    from nanobot.trace import read_trace
+
+    config = _load_config()
+    trace_file = _resolve_trace_file(config.workspace_path, trace_id)
+    if not trace_file:
+        console.print(f"[red]Trace not found:[/red] {trace_id}")
+        raise typer.Exit(1)
+
+    rows = read_trace(trace_file)
+    if not rows:
+        console.print(f"[yellow]Trace empty:[/yellow] {trace_file}")
+        return
+
+    console.print(f"[cyan]Trace[/cyan] {trace_file.stem}")
+    console.print(f"[dim]{trace_file}[/dim]")
+    for r in rows:
+        ts = r.get("ts", "")
+        kind = r.get("kind", "")
+        name = r.get("name", "")
+        status = r.get("status", "")
+        duration = r.get("duration_ms")
+        parts = [f"{ts}", f"{kind}"]
+        if name:
+            parts.append(name)
+        if status:
+            parts.append(f"status={status}")
+        if duration is not None:
+            parts.append(f"duration_ms={duration}")
+        if r.get("error"):
+            parts.append(f"error={r.get('error')}")
+        console.print(" | ".join(parts))
+
+
+@trace_app.command("errors")
+def trace_errors(
+    limit: int = typer.Option(20, "--limit", "-n", help="Number of error traces"),
+):
+    """Show recent traces with error status."""
+    from nanobot.trace import iter_trace_files
+
+    config = _load_config()
+    out: list[dict] = []
+    for f in iter_trace_files(config.workspace_path):
+        s = _trace_summary(f)
+        if s["status"] == "error":
+            out.append(s)
+        if len(out) >= max(1, limit):
+            break
+
+    if not out:
+        console.print("No error traces found.")
+        return
+
+    table = Table(title="Error Traces")
+    table.add_column("Trace ID", style="cyan")
+    table.add_column("Session")
+    table.add_column("Elapsed(ms)", justify="right")
+    table.add_column("Error")
+    for s in out:
+        table.add_row(s["trace_id"], s["session_key"], str(s["elapsed_ms"]), str(s.get("error", "")))
+    console.print(table)
+
+
+@trace_app.command("stuck")
+def trace_stuck(
+    threshold_s: int = typer.Option(60, "--threshold", "-t", help="Elapsed seconds threshold"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max rows"),
+):
+    """Show traces exceeding elapsed threshold."""
+    from nanobot.trace import iter_trace_files
+
+    config = _load_config()
+    threshold_ms = max(1, threshold_s) * 1000
+    hits: list[dict] = []
+    for f in iter_trace_files(config.workspace_path):
+        s = _trace_summary(f)
+        if s["elapsed_ms"] >= threshold_ms:
+            hits.append(s)
+        if len(hits) >= max(1, limit):
+            break
+
+    if not hits:
+        console.print("No slow traces found.")
+        return
+
+    table = Table(title=f"Slow Traces (>= {threshold_s}s)")
+    table.add_column("Trace ID", style="cyan")
+    table.add_column("Status")
+    table.add_column("Contract")
+    table.add_column("Elapsed(ms)", justify="right")
+    table.add_column("Session")
+    for s in hits:
+        table.add_row(
+            s["trace_id"],
+            s["status"],
+            s["final_contract"],
+            str(s["elapsed_ms"]),
+            s["session_key"],
+        )
+    console.print(table)
+
+
+# ============================================================================
 # Status Commands
 # ============================================================================
 
@@ -1173,10 +1335,8 @@ def cron_run(
 @app.command()
 def status():
     """Show nanobot status."""
-    from nanobot.config.loader import load_config, get_config_path
-
-    config_path = get_config_path()
-    config = load_config()
+    config_path = _effective_config_path()
+    config = _load_config()
     workspace = config.workspace_path
 
     console.print(f"{__logo__} nanobot Status\n")

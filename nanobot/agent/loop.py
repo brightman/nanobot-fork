@@ -23,8 +23,9 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.providers.base import LLMProvider
+from nanobot.providers.base import LLMProvider, StreamChunk
 from nanobot.session.manager import Session, SessionManager
+from nanobot.trace import TraceRecorder
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig
@@ -54,6 +55,7 @@ class AgentLoop:
         max_tokens: int = 4096,
         memory_window: int = 100,
         brave_api_key: str | None = None,
+        web_search_provider: str = "brave",
         exec_config: ExecToolConfig | None = None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
@@ -72,6 +74,7 @@ class AgentLoop:
         self.max_tokens = max_tokens
         self.memory_window = memory_window
         self.brave_api_key = brave_api_key
+        self.web_search_provider = web_search_provider
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
@@ -87,6 +90,8 @@ class AgentLoop:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             brave_api_key=brave_api_key,
+            web_search_provider=web_search_provider,
+            cron_service=self.cron_service,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
             parent_tools=self.tools,
@@ -112,7 +117,9 @@ class AgentLoop:
             timeout=self.exec_config.timeout,
             restrict_to_workspace=self.restrict_to_workspace,
         ))
-        self.tools.register(WebSearchTool(api_key=self.brave_api_key))
+        self.tools.register(
+            WebSearchTool(api_key=self.brave_api_key, provider=self.web_search_provider)
+        )
         self.tools.register(WebFetchTool())
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
@@ -176,8 +183,18 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        on_stream: Callable[[StreamChunk], Awaitable[None]] | None = None,
+        tracer: TraceRecorder | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
-        """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
+        """Run the agent iteration loop. Returns (final_content, tools_used, messages).
+
+        Args:
+            initial_messages: Context messages to send to LLM.
+            on_progress: Legacy callback for progress text / tool hints.
+            on_stream: Token-level streaming callback. When provided and the
+                provider supports ``chat_stream()``, text chunks are yielded
+                in real time.
+        """
         messages = initial_messages
         iteration = 0
         final_content = None
@@ -185,14 +202,34 @@ class AgentLoop:
 
         while iteration < self.max_iterations:
             iteration += 1
+            if tracer:
+                tracer.set_turn(iteration)
 
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=self.model,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-            )
+            if tracer:
+                with tracer.span("agent.turn", {"iteration": iteration}):
+                    if on_stream is not None:
+                        with tracer.span("llm.call", {"stream": True, "model": self.model}):
+                            response = await self._chat_with_stream(messages, on_stream)
+                    else:
+                        with tracer.span("llm.call", {"stream": False, "model": self.model}):
+                            response = await self.provider.chat(
+                                messages=messages,
+                                tools=self.tools.get_definitions(),
+                                model=self.model,
+                                temperature=self.temperature,
+                                max_tokens=self.max_tokens,
+                            )
+            elif on_stream is not None:
+                # --- Streaming path ---
+                response = await self._chat_with_stream(messages, on_stream)
+            else:
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=self.tools.get_definitions(),
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )
 
             if response.has_tool_calls:
                 if on_progress:
@@ -200,6 +237,11 @@ class AgentLoop:
                     if clean:
                         await on_progress(clean)
                     await on_progress(self._tool_hint(response.tool_calls), tool_hint=True)
+                if on_stream:
+                    await on_stream(StreamChunk(
+                        type="tool_call_delta",
+                        tool_name=self._tool_hint(response.tool_calls),
+                    ))
 
                 tool_call_dicts = [
                     {
@@ -221,7 +263,21 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    if tracer:
+                        with tracer.span(
+                            "tool.exec",
+                            {"tool_name": tool_call.name, "tool_call_id": tool_call.id},
+                        ):
+                            result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    else:
+                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    if on_stream:
+                        short = result[:200] + "..." if len(result) > 200 else result
+                        await on_stream(StreamChunk(
+                            type="tool_result",
+                            tool_name=tool_call.name,
+                            content=short,
+                        ))
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -231,12 +287,84 @@ class AgentLoop:
 
         if final_content is None and iteration >= self.max_iterations:
             logger.warning("Max iterations ({}) reached", self.max_iterations)
+            if tracer:
+                tracer.event("budget.max_iterations_reached", {"max_iterations": self.max_iterations})
             final_content = (
                 f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
                 "without completing the task. You can try breaking the task into smaller steps."
             )
 
         return final_content, tools_used, messages
+
+    async def _chat_with_stream(
+        self,
+        messages: list[dict],
+        on_stream: Callable[[StreamChunk], Awaitable[None]],
+    ):
+        """Call provider with streaming and assemble full LLMResponse."""
+        from nanobot.providers.base import LLMResponse, ToolCallRequest
+        import json_repair
+
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
+        tool_buffers: dict[int, dict] = {}  # index -> {id, name, args}
+
+        async for chunk in self.provider.chat_stream(
+            messages=messages,
+            tools=self.tools.get_definitions(),
+            model=self.model,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        ):
+            if chunk.type == "text_delta":
+                text_parts.append(chunk.content)
+                await on_stream(chunk)
+            elif chunk.type == "thinking_delta":
+                thinking_parts.append(chunk.content)
+                await on_stream(chunk)
+            elif chunk.type == "tool_call_delta":
+                # Accumulate tool call fragments
+                idx = len(tool_buffers)
+                for i, buf in tool_buffers.items():
+                    if chunk.tool_call_id and buf["id"] == chunk.tool_call_id:
+                        idx = i
+                        break
+                    if not chunk.tool_call_id and chunk.tool_name and buf["name"] == chunk.tool_name:
+                        idx = i
+                        break
+                if idx not in tool_buffers:
+                    tool_buffers[idx] = {
+                        "id": chunk.tool_call_id or f"call_{idx}",
+                        "name": chunk.tool_name or "",
+                        "args": "",
+                    }
+                if chunk.tool_name:
+                    tool_buffers[idx]["name"] = chunk.tool_name
+                if chunk.tool_call_id:
+                    tool_buffers[idx]["id"] = chunk.tool_call_id
+                tool_buffers[idx]["args"] += chunk.tool_args_delta
+            elif chunk.type == "done":
+                break
+
+        # Assemble LLMResponse
+        content = "".join(text_parts) or None
+        reasoning = "".join(thinking_parts) or None
+        tool_calls = []
+        for buf in tool_buffers.values():
+            args = buf["args"]
+            try:
+                parsed = json_repair.loads(args) if args else {}
+            except Exception:
+                parsed = {"raw": args}
+            tool_calls.append(ToolCallRequest(
+                id=buf["id"], name=buf["name"], arguments=parsed,
+            ))
+
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            reasoning_content=reasoning,
+        )
 
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
@@ -294,170 +422,278 @@ class AgentLoop:
         if not lock.locked():
             self._consolidation_locks.pop(session_key, None)
 
+    @staticmethod
+    def _classify_contract(content: str | None) -> str:
+        if not isinstance(content, str) or not content.strip():
+            return "BLOCKED"
+        if content.strip().upper().startswith("BLOCKED"):
+            return "BLOCKED"
+        return "FINAL_DONE"
+
+    @staticmethod
+    def _with_trace_meta(outbound: OutboundMessage, trace_id: str) -> OutboundMessage:
+        meta = dict(outbound.metadata or {})
+        meta["trace_id"] = trace_id
+        outbound.metadata = meta
+        return outbound
+
     async def _process_message(
         self,
         msg: InboundMessage,
         session_key: str | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_stream: Callable[[StreamChunk], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
-        # System messages: parse origin from chat_id ("channel:chat_id")
-        if msg.channel == "system":
-            channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
-                                else ("cli", msg.chat_id))
-            logger.info("Processing system message from {}", msg.sender_id)
-            key = f"{channel}:{chat_id}"
+        tracer: TraceRecorder | None = None
+        trace_status = "ok"
+        trace_contract = "FINAL_DONE"
+        trace_error: str | None = None
+        try:
+            # System messages: parse origin from chat_id ("channel:chat_id")
+            if msg.channel == "system":
+                channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id))
+                key = f"{channel}:{chat_id}"
+                tracer = TraceRecorder(
+                    self.workspace,
+                    trace_id=(msg.metadata or {}).get("trace_id"),
+                    channel=channel,
+                    chat_id=chat_id,
+                    sender_id=msg.sender_id,
+                    session_key=key,
+                )
+                tracer.event("inbound.received", {"source_channel": msg.channel})
+                logger.info("Processing system message from {}", msg.sender_id)
+                session = self.sessions.get_or_create(key)
+                user_key = resolve_user_key(msg.channel, msg.sender_id)
+                session.metadata["user_key"] = user_key
+                self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+                history = session.get_history(max_messages=self.memory_window)
+                with tracer.span("context.build"):
+                    messages = self.context.build_messages(
+                        history=history,
+                        current_message=msg.content,
+                        channel=channel,
+                        chat_id=chat_id,
+                        user_key=user_key,
+                    )
+                final_content, _, all_msgs = await self._run_agent_loop(messages, tracer=tracer)
+                self._save_turn(session, all_msgs, 1 + len(history), user_key=user_key)
+                self.sessions.save(session)
+                content = final_content or "Background task completed."
+                trace_contract = self._classify_contract(content)
+                return self._with_trace_meta(
+                    OutboundMessage(channel=channel, chat_id=chat_id, content=content),
+                    tracer.trace_id,
+                )
+
+            preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
+            logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
+
+            key = session_key or msg.session_key
+            tracer = TraceRecorder(
+                self.workspace,
+                trace_id=(msg.metadata or {}).get("trace_id"),
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                sender_id=msg.sender_id,
+                session_key=key,
+            )
+            tracer.event("inbound.received", {"preview": preview})
+
             session = self.sessions.get_or_create(key)
             user_key = resolve_user_key(msg.channel, msg.sender_id)
             session.metadata["user_key"] = user_key
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
-            history = session.get_history(max_messages=self.memory_window)
-            messages = self.context.build_messages(
-                history=history, current_message=msg.content,
-                channel=channel, chat_id=chat_id, user_key=user_key,
-            )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
-            self._save_turn(session, all_msgs, 1 + len(history), user_key=user_key)
-            self.sessions.save(session)
-            return OutboundMessage(channel=channel, chat_id=chat_id,
-                                  content=final_content or "Background task completed.")
 
-        preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
-        logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
-
-        key = session_key or msg.session_key
-        session = self.sessions.get_or_create(key)
-        user_key = resolve_user_key(msg.channel, msg.sender_id)
-        session.metadata["user_key"] = user_key
-
-        # Slash commands
-        cmd = msg.content.strip().lower()
-        if cmd == "/new":
-            lock = self._get_consolidation_lock(session.key)
-            self._consolidating.add(session.key)
-            try:
-                async with lock:
-                    snapshot = session.messages[session.last_consolidated:]
-                    if snapshot:
-                        temp = Session(key=session.key)
-                        temp.messages = list(snapshot)
-                        if not await self._consolidate_memory(temp, archive_all=True):
-                            return OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content="Memory archival failed, session not cleared. Please try again.",
-                            )
-            except Exception:
-                logger.exception("/new archival failed for {}", session.key)
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="Memory archival failed, session not cleared. Please try again.",
-                )
-            finally:
-                self._consolidating.discard(session.key)
-                self._prune_consolidation_lock(session.key, lock)
-
-            session.clear()
-            self.sessions.save(session)
-            self.sessions.invalidate(session.key)
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started.")
-        if cmd == "/help":
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
-
-        # Claude-style auto-routing: if a subagent profile clearly matches the task,
-        # execute it directly and return the result in this turn.
-        bypass_subagent = msg.content.lstrip().startswith("!main ")
-        user_content_for_routing = msg.content.lstrip()[6:] if bypass_subagent else msg.content
-        routed, route_reason = (None, "bypass-main") if bypass_subagent else await self.subagents.route(user_content_for_routing)
-        if routed is not None:
-            logger.info("Auto-routed task to subagent profile '{}' ({})", routed.name, route_reason)
-            if on_progress:
-                await on_progress(f"Routing task to subagent '{routed.name}' ({route_reason})")
-            result, status = await self.subagents.run_once(task=user_content_for_routing, agent=routed.name)
-            session.add_message("user", user_content_for_routing, user_key=user_key)
-            session.add_message(
-                "assistant",
-                result,
-                user_key=user_key,
-                subagent=routed.name,
-                status=status,
-                route_reason=route_reason,
-            )
-            self.sessions.save(session)
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=result,
-                metadata={
-                    **(msg.metadata or {}),
-                    "subagent": routed.name,
-                    "subagent_status": status,
-                    "subagent_route_reason": route_reason,
-                },
-            )
-
-        unconsolidated = len(session.messages) - session.last_consolidated
-        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
-            self._consolidating.add(session.key)
-            lock = self._get_consolidation_lock(session.key)
-
-            async def _consolidate_and_unlock():
+            # Slash commands
+            cmd = msg.content.strip().lower()
+            if cmd == "/new":
+                tracer.event("command.new")
+                lock = self._get_consolidation_lock(session.key)
+                self._consolidating.add(session.key)
                 try:
                     async with lock:
-                        await self._consolidate_memory(session)
+                        snapshot = session.messages[session.last_consolidated:]
+                        if snapshot:
+                            temp = Session(key=session.key)
+                            temp.messages = list(snapshot)
+                            if not await self._consolidate_memory(temp, archive_all=True):
+                                content = "Memory archival failed, session not cleared. Please try again."
+                                trace_contract = self._classify_contract(content)
+                                return self._with_trace_meta(
+                                    OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content),
+                                    tracer.trace_id,
+                                )
+                except Exception:
+                    logger.exception("/new archival failed for {}", session.key)
+                    content = "Memory archival failed, session not cleared. Please try again."
+                    trace_contract = self._classify_contract(content)
+                    return self._with_trace_meta(
+                        OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content),
+                        tracer.trace_id,
+                    )
                 finally:
                     self._consolidating.discard(session.key)
                     self._prune_consolidation_lock(session.key, lock)
-                    _task = asyncio.current_task()
-                    if _task is not None:
-                        self._consolidation_tasks.discard(_task)
 
-            _task = asyncio.create_task(_consolidate_and_unlock())
-            self._consolidation_tasks.add(_task)
+                session.clear()
+                self.sessions.save(session)
+                self.sessions.invalidate(session.key)
+                content = "New session started."
+                trace_contract = self._classify_contract(content)
+                return self._with_trace_meta(
+                    OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content),
+                    tracer.trace_id,
+                )
+            if cmd == "/help":
+                tracer.event("command.help")
+                content = "🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands"
+                trace_contract = self._classify_contract(content)
+                return self._with_trace_meta(
+                    OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content),
+                    tracer.trace_id,
+                )
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool):
-                message_tool.start_turn()
+            # Claude-style auto-routing: if a subagent profile clearly matches the task,
+            # execute it directly and return the result in this turn.
+            bypass_subagent = msg.content.lstrip().startswith("!main ")
+            user_content_for_routing = msg.content.lstrip()[6:] if bypass_subagent else msg.content
+            routed, route_reason = (
+                (None, "bypass-main")
+                if bypass_subagent
+                else await self.subagents.route(user_content_for_routing)
+            )
+            tracer.event(
+                "subagent.route_decision",
+                {
+                    "bypass": bypass_subagent,
+                    "matched": bool(routed),
+                    "reason": route_reason,
+                    "agent": routed.name if routed else None,
+                },
+            )
+            if routed is not None:
+                logger.info("Auto-routed task to subagent profile '{}' ({})", routed.name, route_reason)
+                if on_progress:
+                    await on_progress(f"Routing task to subagent '{routed.name}' ({route_reason})")
+                with tracer.span("subagent.run_once", {"agent": routed.name}):
+                    result, status = await self.subagents.run_once(task=user_content_for_routing, agent=routed.name)
+                session.add_message("user", user_content_for_routing, user_key=user_key)
+                session.add_message(
+                    "assistant",
+                    result,
+                    user_key=user_key,
+                    subagent=routed.name,
+                    status=status,
+                    route_reason=route_reason,
+                )
+                self.sessions.save(session)
+                trace_contract = self._classify_contract(result)
+                return self._with_trace_meta(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=result,
+                        metadata={
+                            **(msg.metadata or {}),
+                            "subagent": routed.name,
+                            "subagent_status": status,
+                            "subagent_route_reason": route_reason,
+                        },
+                    ),
+                    tracer.trace_id,
+                )
 
-        history = session.get_history(max_messages=self.memory_window)
-        initial_messages = self.context.build_messages(
-            history=history,
-            current_message=msg.content,
-            media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id, user_key=user_key,
-        )
+            unconsolidated = len(session.messages) - session.last_consolidated
+            if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
+                self._consolidating.add(session.key)
+                lock = self._get_consolidation_lock(session.key)
 
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
-            meta = dict(msg.metadata or {})
-            meta["_progress"] = True
-            meta["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
-            ))
+                async def _consolidate_and_unlock():
+                    try:
+                        async with lock:
+                            await self._consolidate_memory(session)
+                    finally:
+                        self._consolidating.discard(session.key)
+                        self._prune_consolidation_lock(session.key, lock)
+                        _task = asyncio.current_task()
+                        if _task is not None:
+                            self._consolidation_tasks.discard(_task)
 
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
-        )
+                _task = asyncio.create_task(_consolidate_and_unlock())
+                self._consolidation_tasks.add(_task)
 
-        if final_content is None:
-            final_content = "I've completed processing but have no response to give."
+            self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+            if message_tool := self.tools.get("message"):
+                if isinstance(message_tool, MessageTool):
+                    message_tool.start_turn()
 
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+            history = session.get_history(max_messages=self.memory_window)
+            with tracer.span("context.build"):
+                initial_messages = self.context.build_messages(
+                    history=history,
+                    current_message=msg.content,
+                    media=msg.media if msg.media else None,
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    user_key=user_key,
+                )
 
-        self._save_turn(session, all_msgs, 1 + len(history), user_key=user_key)
-        self.sessions.save(session)
+            async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+                meta = dict(msg.metadata or {})
+                meta["_progress"] = True
+                meta["_tool_hint"] = tool_hint
+                meta["trace_id"] = tracer.trace_id
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=content,
+                        metadata=meta,
+                    )
+                )
 
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
-                return None
+            final_content, _, all_msgs = await self._run_agent_loop(
+                initial_messages,
+                on_progress=on_progress or _bus_progress,
+                on_stream=on_stream,
+                tracer=tracer,
+            )
 
-        return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=msg.metadata or {},
-        )
+            if final_content is None:
+                final_content = "I've completed processing but have no response to give."
+
+            preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
+            logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+
+            self._save_turn(session, all_msgs, 1 + len(history), user_key=user_key)
+            self.sessions.save(session)
+
+            trace_contract = self._classify_contract(final_content)
+            if message_tool := self.tools.get("message"):
+                if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
+                    tracer.event("response.suppressed", {"reason": "message_tool_sent"})
+                    return None
+
+            return self._with_trace_meta(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=final_content,
+                    metadata=msg.metadata or {},
+                ),
+                tracer.trace_id,
+            )
+        except Exception as e:
+            trace_status = "error"
+            trace_contract = "BLOCKED"
+            trace_error = str(e)
+            if tracer:
+                tracer.event("run.error", {"error": trace_error})
+            raise
+        finally:
+            if tracer:
+                tracer.finish(status=trace_status, final_contract=trace_contract, error=trace_error)
 
     _TOOL_RESULT_MAX_CHARS = 500
 
@@ -491,9 +727,10 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_stream: Callable[[StreamChunk], Awaitable[None]] | None = None,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
+        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress, on_stream=on_stream)
         return response.content if response else ""

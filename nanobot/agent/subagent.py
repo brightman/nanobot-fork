@@ -17,7 +17,10 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.message import MessageTool
+from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
+from nanobot.trace import TraceRecorder
 
 
 @dataclass
@@ -58,11 +61,14 @@ class SubagentManager:
         temperature: float = 0.7,
         max_tokens: int = 4096,
         brave_api_key: str | None = None,
+        web_search_provider: str = "brave",
+        cron_service: "CronService | None" = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
         parent_tools: ToolRegistry | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
+        from nanobot.cron.service import CronService
         self.provider = provider
         self.workspace = workspace
         self.bus = bus
@@ -70,6 +76,8 @@ class SubagentManager:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.brave_api_key = brave_api_key
+        self.web_search_provider = web_search_provider
+        self.cron_service = cron_service
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self.parent_tools = parent_tools
@@ -128,12 +136,20 @@ class SubagentManager:
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
+        tracer = TraceRecorder(
+            self.workspace,
+            channel="subagent",
+            chat_id=agent or "spawn",
+            sender_id="subagent-spawn",
+            session_key=f"subagent:{agent or 'default'}:{task_id}",
+        )
         
         try:
             final_result, status = await self._execute_subagent_task(
                 task_id=task_id,
                 task=task,
                 agent=agent,
+                tracer=tracer,
             )
             
             logger.info("Subagent [{}] completed successfully", task_id)
@@ -150,10 +166,19 @@ class SubagentManager:
         agent: str | None = None,
     ) -> tuple[str, str]:
         """Run a subagent task synchronously and return (status, result)."""
+        session_key = f"subagent:{agent or 'default'}:run_once"
+        tracer = TraceRecorder(
+            self.workspace,
+            channel="subagent",
+            chat_id=agent or "default",
+            sender_id="subagent-cli",
+            session_key=session_key,
+        )
         return await self._execute_subagent_task(
             task_id=f"direct-{str(uuid.uuid4())[:8]}",
             task=task,
             agent=agent,
+            tracer=tracer,
         )
 
     async def chat_turn(
@@ -179,10 +204,18 @@ class SubagentManager:
             ]
 
         history.append({"role": "user", "content": user_input})
+        tracer = TraceRecorder(
+            self.workspace,
+            channel="subagent",
+            chat_id=agent,
+            sender_id="subagent-chat",
+            session_key=f"subagent:{agent}:{session_id}",
+        )
         result, status, updated = await self._run_dialog(
             task_id=f"chat-{str(uuid.uuid4())[:8]}",
             messages=history,
             subdef=subdef,
+            tracer=tracer,
         )
         self._chat_histories[key] = updated[-80:]
         return result, status
@@ -192,6 +225,7 @@ class SubagentManager:
         task_id: str,
         task: str,
         agent: str | None = None,
+        tracer: TraceRecorder | None = None,
     ) -> tuple[str, str]:
         """Execute subagent task and return (result, status)."""
         subdef = self.get_definition(agent) if agent else None
@@ -200,7 +234,12 @@ class SubagentManager:
             {"role": "system", "content": self._build_subagent_prompt(task, subdef=subdef)},
             {"role": "user", "content": task},
         ]
-        result, status, _ = await self._run_dialog(task_id=task_id, messages=messages, subdef=subdef)
+        result, status, _ = await self._run_dialog(
+            task_id=task_id,
+            messages=messages,
+            subdef=subdef,
+            tracer=tracer,
+        )
         return result, status
 
     async def _run_dialog(
@@ -208,6 +247,7 @@ class SubagentManager:
         task_id: str,
         messages: list[dict[str, Any]],
         subdef: SubagentDefinition | None,
+        tracer: TraceRecorder | None = None,
     ) -> tuple[str, str, list[dict[str, Any]]]:
         """Run a dialog loop and return (result, status, updated_messages)."""
         tools = self._build_tool_registry(subdef)
@@ -216,57 +256,106 @@ class SubagentManager:
         model = subdef.model if (subdef and subdef.model) else self.model
         iteration = 0
         final_result: str | None = None
-
-        while iteration < max_iterations:
-            iteration += 1
-
-            response = await self.provider.chat(
-                messages=messages,
-                tools=tools.get_definitions(),
-                model=model,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
+        trace_status = "ok"
+        trace_contract = "FINAL_DONE"
+        trace_error: str | None = None
+        if tracer:
+            tracer.event(
+                "subagent.start",
+                {
+                    "task_id": task_id,
+                    "agent": subdef.name if subdef else "default",
+                    "model": model,
+                    "max_turns": max_iterations,
+                },
             )
 
-            if response.has_tool_calls:
-                tool_call_dicts = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments, ensure_ascii=False),
-                        },
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages.append({
-                    "role": "assistant",
-                    "content": response.content or "",
-                    "tool_calls": tool_call_dicts,
-                })
+        try:
+            while iteration < max_iterations:
+                iteration += 1
+                if tracer:
+                    tracer.set_turn(iteration)
 
-                for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
-                    result = await tools.execute(tool_call.name, tool_call.arguments)
+                if tracer:
+                    with tracer.span("subagent.turn", {"iteration": iteration}):
+                        with tracer.span("subagent.llm.call", {"model": model}):
+                            response = await self.provider.chat(
+                                messages=messages,
+                                tools=tools.get_definitions(),
+                                model=model,
+                                temperature=self.temperature,
+                                max_tokens=self.max_tokens,
+                            )
+                else:
+                    response = await self.provider.chat(
+                        messages=messages,
+                        tools=tools.get_definitions(),
+                        model=model,
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                    )
+
+                if response.has_tool_calls:
+                    tool_call_dicts = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                            },
+                        }
+                        for tc in response.tool_calls
+                    ]
                     messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": tool_call.name,
-                        "content": result,
+                        "role": "assistant",
+                        "content": response.content or "",
+                        "tool_calls": tool_call_dicts,
                     })
-            else:
-                final_result = response.content
-                break
 
-        if not isinstance(final_result, str) or not final_result.strip():
-            final_result = (
-                "Task completed, but the subagent returned an empty response. "
-                "Try refining the task or checking provider/model availability."
-            )
-        messages.append({"role": "assistant", "content": final_result})
-        return final_result, "ok", messages
+                    for tool_call in response.tool_calls:
+                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                        logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
+                        if tracer:
+                            with tracer.span(
+                                "subagent.tool.exec",
+                                {"tool_name": tool_call.name, "tool_call_id": tool_call.id},
+                            ):
+                                result = await tools.execute(tool_call.name, tool_call.arguments)
+                        else:
+                            result = await tools.execute(tool_call.name, tool_call.arguments)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call.name,
+                            "content": result,
+                        })
+                else:
+                    final_result = response.content
+                    break
+
+            if not isinstance(final_result, str) or not final_result.strip():
+                final_result = (
+                    "Task completed, but the subagent returned an empty response. "
+                    "Try refining the task or checking provider/model availability."
+                )
+            messages.append({"role": "assistant", "content": final_result})
+            return final_result, "ok", messages
+        except Exception as e:
+            trace_status = "error"
+            trace_contract = "BLOCKED"
+            trace_error = str(e)
+            raise
+        finally:
+            if tracer:
+                if trace_status == "ok":
+                    if isinstance(final_result, str) and final_result.strip().upper().startswith("BLOCKED"):
+                        trace_contract = "BLOCKED"
+                    elif not isinstance(final_result, str) or not final_result.strip():
+                        trace_contract = "BLOCKED"
+                    else:
+                        trace_contract = "FINAL_DONE"
+                tracer.finish(status=trace_status, final_contract=trace_contract, error=trace_error)
     
     async def _announce_result(
         self,
@@ -663,12 +752,18 @@ When you have completed the task, provide a clear summary of your findings or ac
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
             ),
-            "web_search": WebSearchTool(api_key=self.brave_api_key),
+            "web_search": WebSearchTool(
+                api_key=self.brave_api_key,
+                provider=self.web_search_provider,
+            ),
             "web_fetch": WebFetchTool(),
+            "message": MessageTool(send_callback=self.bus.publish_outbound),
         }
         if subdef and subdef.spawn:
             # Explicitly opt-in only. Default is disabled to match Claude-style subagent behavior.
             candidates["spawn"] = SpawnTool(manager=self)
+        if self.cron_service:
+            candidates["cron"] = CronTool(self.cron_service)
 
         # MCP tools are opt-in via subagent config.
         if subdef and self.parent_tools and subdef.mcp:
